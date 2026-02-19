@@ -4,6 +4,8 @@ import triton
 import triton.language as tl
 from torch.amp import custom_fwd, custom_bwd
 import math
+import warnings
+import torch.nn.functional as F
 
 def _grid(numel: int, bs: int) -> tuple:
     return (triton.cdiv(numel, bs),)
@@ -164,5 +166,43 @@ class SkaFn(Function):
         return gx, gw, None, None
 
 class SKA(torch.nn.Module):
+    _fallback_warned = False
+
+    @staticmethod
+    def _fallback(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+        ks = int(math.sqrt(w.shape[2]))
+        pad = (ks - 1) // 2
+        n, ic, h, width = x.shape
+        wc = w.shape[1]
+
+        x_unfold = F.unfold(x, kernel_size=ks, padding=pad)
+        x_unfold = x_unfold.view(n, ic, ks * ks, h, width)
+
+        repeat_factor = (ic + wc - 1) // wc
+        w_expanded = w.repeat(1, repeat_factor, 1, 1, 1)[:, :ic]
+        return (x_unfold * w_expanded).sum(dim=2)
+
     def forward(self, x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
-        return SkaFn.apply(x, w) # type: ignore
+        if not x.is_cuda:
+            return self._fallback(x, w)
+
+        try:
+            return SkaFn.apply(x, w) # type: ignore
+        except RuntimeError as err:
+            err_msg = str(err)
+            fallback_errors = (
+                "Failed to find C compiler",
+                "Cannot find a working triton",
+                "Triton Error",
+            )
+            if any(msg in err_msg for msg in fallback_errors):
+                if not SKA._fallback_warned:
+                    warnings.warn(
+                        "Triton SKA kernel is unavailable in this environment; "
+                        "falling back to a pure PyTorch implementation. "
+                        "Install a C/C++ compiler (e.g., gcc/g++) for best speed.",
+                        RuntimeWarning,
+                    )
+                    SKA._fallback_warned = True
+                return self._fallback(x, w)
+            raise
